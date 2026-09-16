@@ -38,6 +38,7 @@ func _ready() -> void:
 	client.event_received.connect(_on_event)
 	client.matched.connect(_on_matched)
 	client.resumed.connect(_on_resumed)
+	client.match_corrupt.connect(_on_corrupt)
 	client.match_ended.connect(_on_match_end)
 	client.command_ack.connect(_on_ack)
 	client.replay_received.connect(_on_replay)
@@ -152,6 +153,12 @@ func _on_resumed(match_id: String, seat: int) -> void:
 	root.current_tab = 1
 	_log("已恢复对局 %s" % match_id.substr(0, 8))
 
+func _on_corrupt(match_id: String, message: String) -> void:
+	# 服务端已隔离损坏对局: 清掉本地状态, 绝不在本地继续渲染/结算
+	state = null
+	_log("对局 %s 无法恢复: %s" % [match_id.substr(0, 8), message])
+	status_label.text = "对局已隔离(事件流校验失败)"
+
 func _on_snapshot(s: Variant, dl: Variant) -> void:
 	state = s
 	deadline_at = float(dl) if dl != null else 0.0
@@ -177,8 +184,11 @@ func _on_match_end(winner: Variant, reason: String, _h: String) -> void:
 	else:
 		_log("失败 (%s)" % reason)
 
-func _on_replay(_mid: String, events: Array, full: bool) -> void:
+func _on_replay(_mid: String, events: Array, full: bool,
+		status: String = "", verify_error: Variant = null) -> void:
 	_log("回放: %d 条事件 (完整=%s)" % [events.size(), str(full)])
+	if status == "corrupt":
+		_log("警告: 该对局已隔离, 校验错误: %s" % str(verify_error))
 
 
 # ------------------------------------------------------------- 操作

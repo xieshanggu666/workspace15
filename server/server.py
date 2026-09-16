@@ -28,9 +28,13 @@ from .engine.engine import decide, start_match
 from .engine.errors import RuleError
 from .engine.fold import fold
 from .engine.state import clone, public_event, public_state, state_hash
-from .replay_support import load_match_state
+from .replay_support import load_match_state, ReplayMismatch
 
 log = logging.getLogger("cardarena")
+
+
+class CorruptMatch(Exception):
+    """事件流校验失败, 对局已被隔离, 不得继续结算。"""
 
 
 @dataclass(eq=False)
@@ -95,17 +99,46 @@ class GameServer:
                 m.timer_task.cancel()
         self.conn.close()
 
+    # --------------------------------------------------- 状态装载/隔离(统一)
+
+    def _load_verified(self, mid: str) -> dict:
+        """唯一允许把磁盘对局装回内存的入口: 带检查点校验。
+
+        成功返回 loaded; 校验失败/数据缺失时把对局在 DB 标记 corrupt 并
+        抛 CorruptMatch, 保证损坏事件流绝不进入 LiveMatch/结算循环。
+        """
+        try:
+            return load_match_state(self.conn, mid, verify=True)
+        except ReplayMismatch as exc:
+            storage.quarantine_match(self.conn, mid, str(exc))
+            log.error("对局 %s 事件流校验失败, 已隔离: %s", mid[:8], exc)
+            raise CorruptMatch(mid) from exc
+        except KeyError as exc:
+            storage.quarantine_match(self.conn, mid, f"对局缺失: {exc}")
+            log.error("对局 %s 数据缺失, 已隔离", mid[:8])
+            raise CorruptMatch(mid) from exc
+
+    def _evict_corrupt(self, mid: str) -> list[Client]:
+        """摘除损坏对局的定时器与内存对象, 返回当前在线连接用于通知。"""
+        live = self.matches.pop(mid, None)
+        if live is None:
+            return []
+        if live.timer_task:
+            live.timer_task.cancel()
+            live.timer_task = None
+        return list(live.clients.values())
+
     def _restore_running(self) -> None:
-        """重启恢复: 从 SQLite 重建所有 running 对局的内存状态, 不重新匹配。"""
+        """重启恢复: 仅从校验通过的 running 对局重建内存; 损坏的直接隔离。"""
         rows = self.conn.execute(
             "SELECT match_id FROM matches WHERE status='running'"
         ).fetchall()
+        restored = 0
         for row in rows:
             mid = row["match_id"]
             try:
-                loaded = load_match_state(self.conn, mid, verify=True)
-            except Exception as exc:  # 事件流损坏必须显式暴露, 不得静默续局
-                log.error("对局 %s 恢复校验失败, 跳过: %s", mid[:8], exc)
+                loaded = self._load_verified(mid)
+            except CorruptMatch:
                 continue
             m = LiveMatch(
                 match_id=mid,
@@ -114,8 +147,9 @@ class GameServer:
                 deadline_at=loaded["deadline_at"],
             )
             self.matches[mid] = m
+            restored += 1
         if rows:
-            log.info("恢复 %d 个进行中的对局", len(rows))
+            log.info("扫描 %d 个 running 对局, 恢复 %d 个", len(rows), restored)
 
     # ------------------------------------------------------------- 匹配
 
@@ -317,6 +351,14 @@ class GameServer:
                 "message": outcome["message"],
             })
             return
+        if outcome["status"] == "corrupt":
+            # 对局已隔离; 给发起者的命令回执(通知广播已在锁外投递过)
+            await self._send(client.ws, {
+                "type": "command_result", "op_id": op_id,
+                "accepted": False, "code": "MATCH_CORRUPT",
+                "message": "对局事件流校验失败, 已被隔离",
+            })
+            return
 
         await self._send(client.ws, {
             "type": "command_result", "op_id": op_id,
@@ -336,6 +378,8 @@ class GameServer:
            避免发送期间让出锁而与后续命令交错。
         """
         async with live.lock:
+            corrupt_mail: dict[Client, list[dict]] = {}
+            mail: dict[Client, list[dict]] = {}
             if op_id is not None:
                 cached = storage.cached_result(self.conn, live.match_id, op_id)
                 if cached is not None:
@@ -365,31 +409,45 @@ class GameServer:
                 finished, deadline,
             )
             if stored.get("duplicate"):
-                # 存储层兜底命中(跨进程/竞争窗口): 本次 staged 状态作废,
-                # 用 SQLite 事件流权威重建内存, 保证二者一致。
-                self._rebuild_live_state(live)
-                return {"status": "duplicate",
-                        "state_hash": stored.get("state_hash")}
+                # 存储层兜底命中(跨进程/竞争窗口): 本次 staged 状态作废。
+                # 用带校验的事件流重建内存; 若事件流本身已损坏则隔离整局,
+                # 绝不让损坏状态继续结算。
+                attached = list(live.clients.values())
+                rebuilt = self._rebuild_live_state(live)
+                if rebuilt is None:
+                    corrupt_mail = {c: [{
+                        "type": "match_corrupt",
+                        "match_id": live.match_id,
+                        "message": "对局事件流校验失败, 已被隔离",
+                    }] for c in attached}
+                    state_h = stored.get("state_hash")
+                else:
+                    return {"status": "duplicate",
+                            "state_hash": stored.get("state_hash")}
+            else:
+                # 事务提交成功后才发布到权威内存状态
+                live.state = staged
+                live.deadline_at = deadline
+                self._arm_timer_locked(live)
 
-            # 事务提交成功后才发布到权威内存状态
-            live.state = staged
-            live.deadline_at = deadline
-            self._arm_timer_locked(live)
-
-            # 在锁内基于一致状态构造全部待发载荷(并推进 c.seq)
-            mail = await self._build_broadcast_mail_locked(live)
-            if finished is not None:
-                h = state_hash(live.state)
-                for c in list(live.clients.values()):
-                    mail[c].append({"type": "match_end",
-                                    "match_id": live.match_id,
-                                    "winner": finished[0],
-                                    "reason": finished[1], "state_hash": h})
+                # 在锁内基于一致状态构造全部待发载荷(并推进 c.seq)
+                mail = await self._build_broadcast_mail_locked(live)
+                if finished is not None:
+                    h = state_hash(live.state)
+                    for c in list(live.clients.values()):
+                        mail[c].append({"type": "match_end",
+                                        "match_id": live.match_id,
+                                        "winner": finished[0],
+                                        "reason": finished[1],
+                                        "state_hash": h})
 
         # 锁外发送不可变载荷
-        for c, messages in mail.items():
+        outgoing = corrupt_mail or mail
+        for c, messages in outgoing.items():
             for m in messages:
                 await self._send(c.ws, m)
+        if corrupt_mail:
+            return {"status": "corrupt"}
         return {"status": "applied", "state_hash": state_h}
 
     def _compute_deadline_locked(self, state: dict) -> float:
@@ -398,12 +456,29 @@ class GameServer:
             return now + self.response_seconds
         return now + self.turn_seconds
 
-    def _rebuild_live_state(self, live: LiveMatch) -> None:
-        """用 SQLite 事件流重建内存状态(幂等竞争兜底/重启恢复共用)。"""
-        loaded = load_match_state(self.conn, live.match_id)
+    def _rebuild_live_state(self, live: LiveMatch) -> dict | None:
+        """用通过校验的 SQLite 事件流重建内存状态(幂等竞争兜底共用)。
+
+        校验失败时隔离对局并返回 None; 调用方必须停止后续结算。
+        必须在持有 live.lock 时调用。
+        """
+        try:
+            loaded = self._load_verified(live.match_id)
+        except CorruptMatch:
+            self._quarantine_live(live.match_id,
+                                  "重建内存状态时校验失败")
+            return None
         live.state = loaded["state"]
         live.deadline_at = loaded["deadline_at"]
         self._arm_timer_locked(live)
+        return loaded
+
+    def _quarantine_live(self, mid: str, detail: str) -> None:
+        """隔离一个运行中发现损坏的对局: 取消定时器、摘除内存对象、
+        DB 标记 corrupt。持锁调用; 通知由外层在锁外投递。"""
+        storage.quarantine_match(self.conn, mid, detail)
+        self._evict_corrupt(mid)
+        log.error("对局 %s 已隔离: %s", mid[:8], detail)
 
     # ------------------------------------------------------------- 广播/补发
 
@@ -442,40 +517,98 @@ class GameServer:
     async def _try_resume(self, c: Client) -> None:
         mid = storage.active_match_for(self.conn, c.name)
         if not mid:
+            # 没有 running 对局: 若最近一局是 corrupt, 明确告知而非静默滞留
+            latest = storage.latest_match_for(self.conn, c.name)
+            if latest and latest[1] == "corrupt":
+                await self._send(c.ws, {
+                    "type": "match_corrupt", "match_id": latest[0],
+                    "message": "对局事件流校验失败, 已被隔离, 无法恢复",
+                })
             return
-        live = self.matches.get(mid)
-        if live is None:  # 极端情况: 内存缺失则重新加载
-            loaded = load_match_state(self.conn, mid)
-            live = LiveMatch(mid, loaded["names"], loaded["state"],
-                             deadline_at=loaded["deadline_at"])
-            self.matches[mid] = live
-            async with live.lock:
-                self._arm_timer_locked(live)
+        try:
+            live = await self._get_or_load_live(mid)
+        except CorruptMatch:
+            self._evict_corrupt(mid)
+            await self._send(c.ws, {
+                "type": "match_corrupt", "match_id": mid,
+                "message": "对局事件流校验失败, 已被隔离, 无法恢复",
+            })
+            return
+        if live is None:
+            return
         seat = live.seats.index(c.name) if c.name in live.seats else None
         if seat is None:
             return
         # 座位占用与事件补发必须在对局锁内完成: 不能让一条并发命令在
         # "已 attach、未补发"之间推进 c.seq 造成事件乱序。
+        quarantine_notice: dict[Client, list[dict]] = {}
+        messages: list[dict] = []
+        # 校验前先登记新连接, 这样无论内存中还是磁盘上的损坏被发现,
+        # 重连者本人一定能收到隔离通知(此时其尚未被 attach 到 live.clients)。
+        pending_clients = list(live.clients.values()) + [c]
         async with live.lock:
-            self._attach(live, seat, c)
-            messages = [{"type": "match_resume", "match_id": mid,
-                         "seat": seat}]
-            rows = storage.events_after(self.conn, mid, 0)
-            last = 0
-            for row in rows:
-                last = row["seq"]
-                visible = public_event(row["event"], seat)
-                if visible is not None:
-                    messages.append({"type": "event", "seq": row["seq"],
-                                     "event": visible})
-            messages.append({
-                "type": "snapshot",
-                "state": public_state(live.state, seat),
-                "deadline_at": live.deadline_at,
-            })
-            c.seq = last
+            # 持锁后再次确认对局未在等待期间被隔离(例如定时器校验失败)
+            if storage.match_status(self.conn, mid) != "running":
+                return
+            # 内存已有对局也要校验磁盘事件流: 外部篡改/磁盘异常导致的损坏
+            # 必须在重连时挡住, 不能借内存对象"复活"损坏对局。
+            try:
+                loaded = self._load_verified(mid)
+            except CorruptMatch:
+                self._quarantine_live(mid, "重连时磁盘事件流校验失败")
+                quarantine_notice = {
+                    oc: [{"type": "match_corrupt", "match_id": mid,
+                          "message": "对局事件流校验失败, 已被隔离"}]
+                    for oc in pending_clients}
+                loaded = None
+            if loaded is not None and loaded["hash"] != state_hash(live.state):
+                self._quarantine_live(
+                    mid, f"内存/磁盘状态哈希不一致 "
+                         f"{state_hash(live.state)} != {loaded['hash']}")
+                quarantine_notice = {
+                    oc: [{"type": "match_corrupt", "match_id": mid,
+                          "message": "对局内存与事件流不一致, 已被隔离"}]
+                    for oc in pending_clients}
+            elif loaded is not None:
+                self._attach(live, seat, c)
+                messages = [{"type": "match_resume", "match_id": mid,
+                             "seat": seat}]
+                rows = storage.events_after(self.conn, mid, 0)
+                last = 0
+                for row in rows:
+                    last = row["seq"]
+                    visible = public_event(row["event"], seat)
+                    if visible is not None:
+                        messages.append({"type": "event", "seq": row["seq"],
+                                         "event": visible})
+                messages.append({
+                    "type": "snapshot",
+                    "state": public_state(live.state, seat),
+                    "deadline_at": live.deadline_at,
+                })
+                c.seq = last
+        # 锁外投递
+        if quarantine_notice:
+            await self._deliver_mail(quarantine_notice)
+            return
         for m in messages:
             await self._send(c.ws, m)
+
+    async def _get_or_load_live(self, mid: str) -> LiveMatch | None:
+        """获取内存对局; 内存缺失时走唯一的校验装载入口。
+
+        损坏事件流在此被挡住, 绝不可能构造 LiveMatch 重新进入结算。
+        """
+        live = self.matches.get(mid)
+        if live is not None:
+            return live
+        loaded = self._load_verified(mid)
+        live = LiveMatch(mid, loaded["names"], loaded["state"],
+                         deadline_at=loaded["deadline_at"])
+        self.matches[mid] = live
+        async with live.lock:
+            self._arm_timer_locked(live)
+        return live
 
     def _attach(self, live: LiveMatch, seat: int, c: Client) -> None:
         live.clients[seat] = c
@@ -554,46 +687,23 @@ class GameServer:
         async with live.lock:
             # 三重作废检查: 已被更新的定时器取代 / 截止时间被宽限或命令延后 /
             # 对局已结束。任何一条成立都不得结算, 杜绝陈旧超时重复落事件。
-            if (live.timer_epoch != epoch
-                    or live.timer_task is not asyncio.current_task()
-                    or live.state["winner"] is not None):
-                return
-            if live.deadline_at and time.time() < live.deadline_at - 0.01:
-                return
-            seat = (live.state["responder"]
-                    if live.state["phase"] == "response"
-                    else live.state["active"])
-            command = {"cmd": "SYSTEM_TIMEOUT", "seat": seat,
-                       "reason": "deadline"}
-            try:
-                new_events = decide(live.state, command)
-            except RuleError:
-                return
-            staged = clone(live.state)
-            finished = None
-            for e in new_events:
-                fold(staged, e)
-                if e["type"] == "GAME_ENDED":
-                    finished = (e["winner"], e["reason"])
-            deadline = None if finished else self._compute_deadline_locked(
-                staged)
-            h = state_hash(staged)
-            storage.apply_command(
-                self.conn, match_id, None, seat, command,
-                new_events, {"accepted": True, "state_hash": h},
-                finished, deadline,
+            stale = (
+                live.timer_epoch != epoch
+                or live.timer_task is not asyncio.current_task()
+                or live.state["winner"] is not None
+                or storage.match_status(self.conn, match_id) != "running"
+                or (live.deadline_at
+                    and time.time() < live.deadline_at - 0.01)
             )
-            live.state = staged
-            live.deadline_at = deadline
-            self._arm_timer_locked(live)
-            mail = await self._build_broadcast_mail_locked(live)
-            if finished is not None:
-                for c in list(live.clients.values()):
-                    mail.setdefault(c, []).append({
-                        "type": "match_end", "match_id": match_id,
-                        "winner": finished[0], "reason": finished[1],
-                        "state_hash": h})
-        await self._deliver_mail(mail)
+        if stale:
+            return
+        seat = (live.state["responder"]
+                if live.state["phase"] == "response"
+                else live.state["active"])
+        # 与玩家命令同一结算入口: 锁内校验/克隆/事务提交/隔离处理一致
+        await self._apply_under_lock(
+            live, {"cmd": "SYSTEM_TIMEOUT", "seat": seat,
+                   "reason": "deadline"}, None)
 
     # ------------------------------------------------------------- 回放
 
@@ -610,9 +720,17 @@ class GameServer:
             visible = public_event(row["event"], viewer)
             if visible is not None:
                 out.append({"seq": row["seq"], "event": visible})
+        # 只读审计: 即便对局已隔离也允许查看事件, 但显式标注校验结果
+        verify_error = None
+        if m["status"] in ("running", "corrupt"):
+            try:
+                load_match_state(self.conn, match_id, verify=True)
+            except ReplayMismatch as exc:
+                verify_error = str(exc)
         await self._send(c.ws, {"type": "replay", "match_id": match_id,
-                                "events": out,
-                                "full": is_player})
+                                "events": out, "full": is_player,
+                                "status": m["status"],
+                                "verify_error": verify_error})
 
     # ------------------------------------------------------------- 辅助
 

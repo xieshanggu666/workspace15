@@ -51,6 +51,17 @@ def load_match_state(conn: sqlite3.Connection, match_id: str,
         if mismatches:
             raise ReplayMismatch(
                 f"对局 {match_id} 事件流与检查点不一致: {mismatches[:5]}")
+        # 反向检查: 每条带 op_id 的玩家命令都必须有检查点,
+        # 缺失意味着命令落库但哈希锚点丢失, 事件流不可信。
+        cmd_rows = conn.execute(
+            "SELECT seq FROM commands WHERE match_id=? AND op_id IS NOT NULL",
+            (match_id,),
+        ).fetchall()
+        missing = [r["seq"] for r in cmd_rows
+                   if r["seq"] not in checkpoints]
+        if missing:
+            raise ReplayMismatch(
+                f"对局 {match_id} 缺少命令检查点: {missing[:5]}")
 
     return {
         "state": state,

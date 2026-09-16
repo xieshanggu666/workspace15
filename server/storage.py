@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS players (
 CREATE TABLE IF NOT EXISTS matches (
     match_id    TEXT PRIMARY KEY,
     created_at  REAL NOT NULL,
-    status      TEXT NOT NULL,             -- running | finished
+    status      TEXT NOT NULL,             -- running | finished | corrupt
     winner      INTEGER,
     end_reason  TEXT,
     seed        INTEGER NOT NULL,
@@ -64,6 +64,12 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     state_hash  TEXT NOT NULL,
     PRIMARY KEY (match_id, cmd_seq)
 ) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS corruption (
+    -- 校验失败审计: 哪些对局在何时因什么原因被隔离
+    match_id  TEXT PRIMARY KEY,
+    at        REAL NOT NULL,
+    detail    TEXT NOT NULL
+);
 """
 
 
@@ -132,6 +138,16 @@ def active_match_for(conn: sqlite3.Connection, name: str) -> str | None:
     return row["match_id"] if row else None
 
 
+def latest_match_for(conn: sqlite3.Connection, name: str) -> tuple[str, str] | None:
+    """玩家最近一局及其状态(含 finished/corrupt), 用于告知重连者不能恢复。"""
+    row = conn.execute(
+        "SELECT match_id, status FROM matches WHERE "
+        "(json_extract(names,'$[0]')=? OR json_extract(names,'$[1]')=?) "
+        "ORDER BY created_at DESC LIMIT 1", (name, name),
+    ).fetchone()
+    return (row["match_id"], row["status"]) if row else None
+
+
 def set_deadline(conn: sqlite3.Connection, match_id: str,
                  deadline_at: float | None) -> None:
     conn.execute("UPDATE matches SET deadline_at=? WHERE match_id=?",
@@ -146,6 +162,29 @@ def finish_match(conn: sqlite3.Connection, match_id: str,
         "WHERE match_id=?", (winner, reason, match_id),
     )
     conn.commit()
+
+
+def quarantine_match(conn: sqlite3.Connection, match_id: str,
+                     detail: str) -> None:
+    """把校验失败的对局标记为 corrupt 并停掉定时器。
+
+    corrupt 与 finished 一样不会被匹配/重连/恢复路径重新装回内存;
+    但保留全部事件以便事后用 replay/verify 排查。原因记入 corruption 审计表。
+    """
+    with conn:
+        conn.execute(
+            "UPDATE matches SET status='corrupt', winner=NULL, deadline_at=NULL"
+            " WHERE match_id=?", (match_id,))
+        conn.execute(
+            "INSERT OR REPLACE INTO corruption(match_id, at, detail)"
+            " VALUES(?,?,?)", (match_id, time.time(), detail))
+
+
+def match_status(conn: sqlite3.Connection, match_id: str) -> str | None:
+    row = conn.execute(
+        "SELECT status FROM matches WHERE match_id=?", (match_id,)
+    ).fetchone()
+    return row["status"] if row else None
 
 
 # ----------------------------------------------------------- 事件/命令/幂等

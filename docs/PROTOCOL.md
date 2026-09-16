@@ -41,11 +41,23 @@
 |---|---|
 | `login_ok` / `login_fail` | 返回持久 token |
 | `match_begin` / `match_resume` | `{match_id, seat}` |
+| `match_corrupt` | `{match_id, message}` 事件流校验失败, 对局已隔离, 不会也不能恢复 |
 | `event` | `{seq, event}`，**按座位过滤**：对手抽牌只有 `count`；洗牌事件不下发 |
 | `snapshot` | `{state, deadline_at}` 完整权威状态（对手手牌/牌库只有 count） |
 | `command_result` | `{op_id, accepted, duplicate?, code?}` |
 | `match_end` | `{winner: 0|1|null, reason, state_hash}` |
-| `replay` | `{match_id, events, full}` |
+| `replay` | `{match_id, events, full, status, verify_error}`；只读审计，已隔离对局仍可查看，`status="corrupt"` 且 `verify_error` 非空 |
+
+## 损坏事件流隔离
+
+重启恢复、断线重连（即使内存已有 LiveMatch，也会在持锁时重新校验磁盘事件流
+并比对内存/磁盘哈希）、运行期幂等兜底重建共用唯一入口 `_load_verified`，
+用 checkpoints 逐条正向校验 + 反向确认每条玩家命令都有锚点。任何不一致
+（事件重复/丢失/乱序、哈希分叉、检查点缺失）都会：把 `matches.status` 置为
+`corrupt`、原因写入 `corruption` 审计表、摘除内存对象并取消定时器，向在场
+连接和重连者发 `match_corrupt`。`corrupt` 对局不会被 `active_match_for`
+找回、不能借重连复活、定时器不再触发；其事件保留仅供 `replay` / `--verify`
+排查（回放响应带 `status` 与 `verify_error`）。
 
 ## 事件类型（落库 + 回放共用，按触发顺序）
 

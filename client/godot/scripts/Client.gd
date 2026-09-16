@@ -6,11 +6,12 @@ signal connected_ok(token)
 signal login_failed(code)
 signal matched(match_id, seat)
 signal resumed(match_id, seat)
+signal match_corrupt(match_id, message)
 signal snapshot_received(state, deadline_at)
 signal event_received(seq, event)
 signal match_ended(winner, reason, state_hash)
 signal command_ack(op_id, accepted, duplicate, payload)
-signal replay_received(match_id, events, full)
+signal replay_received(match_id, events, full, status, verify_error)
 signal connection_status(text)
 
 var _ws: WebSocketPeer = WebSocketPeer.new()
@@ -65,6 +66,9 @@ func _handle(msg: Variant) -> void:
 			matched.emit(msg["match_id"], msg["seat"])
 		"match_resume":
 			resumed.emit(msg["match_id"], msg["seat"])
+		"match_corrupt":
+			match_corrupt.emit(msg.get("match_id", ""),
+				msg.get("message", "对局事件流校验失败, 已被隔离"))
 		"snapshot":
 			snapshot_received.emit(msg["state"], msg.get("deadline_at"))
 		"event":
@@ -78,7 +82,8 @@ func _handle(msg: Variant) -> void:
 				msg.get("state_hash"))
 		"replay":
 			replay_received.emit(msg["match_id"], msg.get("events", []),
-				bool(msg.get("full", false)))
+				bool(msg.get("full", false)), msg.get("status", ""),
+				msg.get("verify_error"))
 		"error":
 			push_warning("服务端错误: %s" % msg.get("code", "?"))
 		_:

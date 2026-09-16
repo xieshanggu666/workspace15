@@ -30,6 +30,13 @@ Godot 4 客户端 + **无界面权威服务端**（Python / asyncio / WebSocket 
 - **哈希检查点**：每条玩家命令与其产生的事件、落库后状态哈希同事务写入
   `checkpoints`；重启恢复与 `python -m scripts.replay --verify` 逐条比对，
   事件流一旦重复/丢失/乱序立即报 `ReplayMismatch`。
+- **损坏事件流统一隔离**：重启恢复、断线重连（含内存已有对局时的磁盘
+  再校验）、运行期幂等兜底重建共用唯一校验入口 `_load_verified`，并用
+  `checkpoints` 逐条比对事件流、反向校验每条玩家命令都有锚点。任何不一致
+  （事件重复/丢失/乱序、内存与磁盘哈希分叉、锚点缺失）都会：把
+  `matches.status` 置为 `corrupt`（原因入 `corruption` 审计表）、摘除内存
+  对象并取消定时器、向在场连接和重连者发 `match_corrupt`。损坏对局不能借
+  重连复活、定时器不再触发，事件保留供只读回放审计。
 - **掉线可恢复**：令牌持久化；重连登录后自动 `match_resume` → 补发缺失事件 →
   下发权威 snapshot。断线在每个回合/响应窗给予一次宽限，宽限落库，重启后延续。
 - **超时由服务端驱动**：客户端无法靠不响应卡住对局。响应窗超时=强制通过，
@@ -54,7 +61,7 @@ server/
   server.py          WebSocket 连接/匹配/广播/超时/重连/重启恢复
   __main__.py        python -m server
 client/godot/        Godot 4 工程(主场景 Main.tscn, 纯渲染+转发)
-tests/               12 引擎单测 + 4 存储并发测试 + 17 真实 WebSocket 集成测试
+tests/               12 引擎 + 4 存储并发 + 17 WebSocket 集成 + 8 损坏隔离测试
 scripts/             启动/测试/回放 CLI
 docs/PROTOCOL.md     消息与事件协议
 ```
