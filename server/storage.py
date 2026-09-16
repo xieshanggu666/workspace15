@@ -55,7 +55,15 @@ CREATE TABLE IF NOT EXISTS idem_results (
     op_id    TEXT NOT NULL,
     result   TEXT NOT NULL,               -- JSON: 首次命令的响应
     PRIMARY KEY (match_id, op_id)
-);
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS checkpoints (
+    -- 每条玩家命令落库后的权威状态哈希; 回放/重启时逐条比对,
+    -- 证明"SQLite 事件流 fold 出的状态 == 现场内存状态"。
+    match_id    TEXT NOT NULL,
+    cmd_seq     INTEGER NOT NULL,
+    state_hash  TEXT NOT NULL,
+    PRIMARY KEY (match_id, cmd_seq)
+) WITHOUT ROWID;
 """
 
 
@@ -211,7 +219,13 @@ def apply_command(
     finished: tuple[int | None, str] | None,
     deadline_at: float | None,
 ) -> dict[str, Any]:
-    """事务化写入一条命令及其事件。返回含 event_seq 区间的结果。"""
+    """事务化写入一条命令及其事件与状态哈希检查点。
+
+    并发安全: 即便调用方在 SELECT 与本函数之间被另一进程/连接抢先写入同一
+    op_id(SELECT 未命中), idem_results 的 PRIMARY KEY 也会让 INSERT 失败,
+    整个事务回滚(命令、事件、检查点一个都不会留下), 然后返回首次结果。
+    返回 {"duplicate": True, ...} 表示本次未发生任何写入/扣费。
+    """
     with conn:  # 自动提交/回滚
         if op_id is not None:
             existing = conn.execute(
@@ -221,38 +235,58 @@ def apply_command(
             if existing:
                 return {"duplicate": True, **json.loads(existing["result"])}
 
-        cur = conn.execute(
-            "INSERT INTO commands(match_id, op_id, seat, cmd, payload, at)"
-            " VALUES(?,?,?,?,?,?)",
-            (match_id, op_id, seat, command.get("cmd"),
-             json.dumps(command, ensure_ascii=False), time.time()),
-        )
-        cmd_seq = cur.lastrowid
-        first = last = None
-        for e in new_events:
+        try:
             cur = conn.execute(
-                "INSERT INTO events(match_id, after_cmd, evt) VALUES(?,?,?)",
-                (match_id, cmd_seq, json.dumps(e, ensure_ascii=False)),
+                "INSERT INTO commands(match_id, op_id, seat, cmd, payload, at)"
+                " VALUES(?,?,?,?,?,?)",
+                (match_id, op_id, seat, command.get("cmd"),
+                 json.dumps(command, ensure_ascii=False), time.time()),
             )
-            first = first if first is not None else cur.lastrowid
-            last = cur.lastrowid
+            cmd_seq = cur.lastrowid
+            first = last = None
+            for e in new_events:
+                cur = conn.execute(
+                    "INSERT INTO events(match_id, after_cmd, evt) VALUES(?,?,?)",
+                    (match_id, cmd_seq, json.dumps(e, ensure_ascii=False)),
+                )
+                first = first if first is not None else cur.lastrowid
+                last = cur.lastrowid
 
-        payload = dict(result)
-        if op_id is not None:
+            # 权威状态哈希与命令同事务落库; 回放时用它证明事件流无重复/无丢失
             conn.execute(
-                "INSERT INTO idem_results(match_id, op_id, result) VALUES(?,?,?)",
-                (match_id, op_id, json.dumps(payload, ensure_ascii=False)),
+                "INSERT INTO checkpoints(match_id, cmd_seq, state_hash)"
+                " VALUES(?,?,?)",
+                (match_id, cmd_seq, result["state_hash"]),
             )
-        if finished is not None:
-            winner, reason = finished
-            conn.execute(
-                "UPDATE matches SET status='finished', winner=?, end_reason=?,"
-                " deadline_at=NULL WHERE match_id=?",
-                (winner, reason, match_id),
-            )
-        else:
-            conn.execute("UPDATE matches SET deadline_at=? WHERE match_id=?",
-                         (deadline_at, match_id))
+
+            if op_id is not None:
+                conn.execute(
+                    "INSERT INTO idem_results(match_id, op_id, result)"
+                    " VALUES(?,?,?)",
+                    (match_id, op_id,
+                     json.dumps(dict(result), ensure_ascii=False)),
+                )
+            if finished is not None:
+                winner, reason = finished
+                conn.execute(
+                    "UPDATE matches SET status='finished', winner=?,"
+                    " end_reason=?, deadline_at=NULL WHERE match_id=?",
+                    (winner, reason, match_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE matches SET deadline_at=? WHERE match_id=?",
+                    (deadline_at, match_id),
+                )
+        except sqlite3.IntegrityError:
+            # 唯一约束(op_id 重复)冲突: with conn 会回滚全部写入
+            row = conn.execute(
+                "SELECT result FROM idem_results WHERE match_id=? AND op_id=?",
+                (match_id, op_id),
+            ).fetchone()
+            if row is not None:
+                return {"duplicate": True, **json.loads(row["result"])}
+            raise
 
     out = dict(result)
     out["duplicate"] = False
@@ -260,3 +294,24 @@ def apply_command(
     out["event_from"] = first
     out["event_to"] = last
     return out
+
+
+# ------------------------------------------------------------- 哈希检查点
+
+def checkpoints(conn: sqlite3.Connection, match_id: str) -> dict[int, str]:
+    """{cmd_seq: 落库时的权威状态哈希}。"""
+    rows = conn.execute(
+        "SELECT cmd_seq, state_hash FROM checkpoints WHERE match_id=?"
+        " ORDER BY cmd_seq", (match_id,),
+    ).fetchall()
+    return {r["cmd_seq"]: r["state_hash"] for r in rows}
+
+
+def event_command_map(conn: sqlite3.Connection, match_id: str
+                      ) -> dict[int, int]:
+    """{事件全局 seq: 所属命令 seq}(仅 after_cmd 非空的事件)。"""
+    rows = conn.execute(
+        "SELECT seq, after_cmd FROM events WHERE match_id=?"
+        " AND after_cmd IS NOT NULL ORDER BY seq", (match_id,),
+    ).fetchall()
+    return {r["seq"]: r["after_cmd"] for r in rows}

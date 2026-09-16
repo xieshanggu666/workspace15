@@ -27,13 +27,13 @@ from .engine.deck import validate_deck
 from .engine.engine import decide, start_match
 from .engine.errors import RuleError
 from .engine.fold import fold
-from .engine.state import public_event, public_state, state_hash
+from .engine.state import clone, public_event, public_state, state_hash
 from .replay_support import load_match_state
 
 log = logging.getLogger("cardarena")
 
 
-@dataclass
+@dataclass(eq=False)
 class Client:
     name: str
     ws: Any
@@ -51,6 +51,7 @@ class LiveMatch:
     deadline_at: float | None = None
     grace_used_window: int = -1  # 已用过断线宽限的响应窗口/回合序号
     timer_task: asyncio.Task | None = None
+    timer_epoch: int = 0  # 每次重新 arm 自增, 旧定时任务据此自我作废
 
     def client_for(self, name: str) -> Client | None:
         for seat, n in enumerate(self.seats):
@@ -101,7 +102,11 @@ class GameServer:
         ).fetchall()
         for row in rows:
             mid = row["match_id"]
-            loaded = load_match_state(self.conn, mid)
+            try:
+                loaded = load_match_state(self.conn, mid, verify=True)
+            except Exception as exc:  # 事件流损坏必须显式暴露, 不得静默续局
+                log.error("对局 %s 恢复校验失败, 跳过: %s", mid[:8], exc)
+                continue
             m = LiveMatch(
                 match_id=mid,
                 seats=loaded["names"],
@@ -161,18 +166,17 @@ class GameServer:
 
         live = LiveMatch(match_id=mid, seats=[name0, name1], state=state,
                          deadline_at=deadline)
-        self.matches[mid] = live
         for seat, (name, c) in enumerate(((name0, c0), (name1, c1))):
             if c is not None:
                 self._attach(live, seat, c)
-        # 先通知座位, 再补发过滤后的事件, 最后给权威快照(客户端据此渲染)
-        for seat, c in live.clients.items():
-            await self._send(c.ws, {"type": "match_begin", "match_id": mid,
-                                    "seat": seat})
-        for seat, c in live.clients.items():
-            await self._catch_up(live, seat, c, since=0)
-            await self._send_snapshot(live, seat, c)
-        self._arm_timer(mid)
+        async with live.lock:
+            self.matches[mid] = live
+            self._arm_timer_locked(live)
+            mail = await self._build_broadcast_mail_locked(live)
+            for seat, c in live.clients.items():
+                mail[c].insert(0, {"type": "match_begin",
+                                   "match_id": mid, "seat": seat})
+        await self._deliver_mail(mail)
         log.info("对局开始 %s: %s vs %s", mid[:8], name0, name1)
 
     # ------------------------------------------------------------- 连接
@@ -247,9 +251,28 @@ class GameServer:
             live = self._live_for(client.name)
             if live:
                 seat = live.seats.index(client.name)
-                await self._catch_up(live, seat, client,
-                                     since=int(msg.get("last_seq", 0)))
-                await self._send_snapshot(live, seat, client)
+                async with live.lock:
+                    rows = storage.events_after(
+                        self.conn, live.match_id,
+                        int(msg.get("last_seq", client.seq)))
+                    messages = []
+                    last = client.seq
+                    for row in rows:
+                        last = row["seq"]
+                        visible = public_event(row["event"], seat)
+                        if visible is not None:
+                            messages.append({"type": "event",
+                                             "seq": row["seq"],
+                                             "event": visible})
+                    snap = {
+                        "type": "snapshot",
+                        "state": public_state(live.state, seat),
+                        "deadline_at": live.deadline_at,
+                    }
+                    client.seq = last
+                for m in messages:
+                    await self._send(client.ws, m)
+                await self._send(client.ws, snap)
             return client
 
         if t == "replay":
@@ -277,92 +300,142 @@ class GameServer:
         command = dict(command)
         command["seat"] = seat
 
+        outcome = await self._apply_under_lock(live, command, op_id)
+
+        if outcome["status"] == "duplicate":
+            # 重复 op_id: 回首次结果; 不结算、不扣费、不追加事件
+            await self._send(client.ws, {
+                "type": "command_result", "op_id": op_id,
+                "duplicate": True, "accepted": True,
+                "state_hash": outcome.get("state_hash"),
+            })
+            return
+        if outcome["status"] == "rejected":
+            await self._send(client.ws, {
+                "type": "command_result", "op_id": op_id,
+                "accepted": False, "code": outcome["code"],
+                "message": outcome["message"],
+            })
+            return
+
+        await self._send(client.ws, {
+            "type": "command_result", "op_id": op_id,
+            "accepted": True, "state_hash": outcome["state_hash"],
+        })
+
+    async def _apply_under_lock(self, live: LiveMatch, command: dict,
+                                op_id: str | None) -> dict:
+        """玩家命令与系统超时唯一的结算入口。
+
+        关键不变量:
+        1. 全程持有 live.lock(仅在网络发送时不持有, 见下), 并发命令(含同
+           op_id 重发、玩家命令与超时竞争)被严格串行化, 不会重复结算。
+        2. 先在状态克隆上 fold 并提交 SQLite, 提交成功后才替换 live.state;
+           任何中途异常都不会污染权威内存状态。
+        3. 广播载荷在锁内基于一致状态构造并推进 c.seq, 网络发送移到锁外,
+           避免发送期间让出锁而与后续命令交错。
+        """
         async with live.lock:
-            cached = storage.cached_result(self.conn, live.match_id, op_id)
-            if cached is not None:
-                # 重复操作: 回首次结果, 不再结算、不扣费
-                await self._send(client.ws, {
-                    "type": "command_result", "op_id": op_id,
-                    "duplicate": True, "accepted": True,
-                    "state_hash": cached.get("state_hash"),
-                })
-                return
+            if op_id is not None:
+                cached = storage.cached_result(self.conn, live.match_id, op_id)
+                if cached is not None:
+                    return {"status": "duplicate",
+                            "state_hash": cached.get("state_hash")}
 
             try:
                 new_events = decide(live.state, command)
             except RuleError as e:
-                # 拒绝: 不写命令、不扣资源; 记一条幂等失败也没必要
-                await self._send(client.ws, {
-                    "type": "command_result", "op_id": op_id,
-                    "accepted": False, "code": e.code, "message": str(e),
-                })
-                return
+                return {"status": "rejected", "code": e.code,
+                        "message": str(e)}
 
+            # 在克隆上结算; 此刻 live.state 仍未改变
+            staged = clone(live.state)
             finished = None
             for e in new_events:
-                fold(live.state, e)
+                fold(staged, e)
                 if e["type"] == "GAME_ENDED":
                     finished = (e["winner"], e["reason"])
 
-            deadline = None if finished else self._compute_deadline(live)
-            result = {"accepted": True,
-                      "state_hash": state_hash(live.state)}
+            deadline = None if finished else self._compute_deadline_locked(
+                staged)
+            state_h = state_hash(staged)
             stored = storage.apply_command(
-                self.conn, live.match_id, op_id, seat, command,
-                new_events, result, finished, deadline,
+                self.conn, live.match_id, op_id, command.get("seat"),
+                command, new_events, {"accepted": True, "state_hash": state_h},
+                finished, deadline,
             )
+            if stored.get("duplicate"):
+                # 存储层兜底命中(跨进程/竞争窗口): 本次 staged 状态作废,
+                # 用 SQLite 事件流权威重建内存, 保证二者一致。
+                self._rebuild_live_state(live)
+                return {"status": "duplicate",
+                        "state_hash": stored.get("state_hash")}
+
+            # 事务提交成功后才发布到权威内存状态
+            live.state = staged
             live.deadline_at = deadline
-            self._arm_timer(live.match_id)
+            self._arm_timer_locked(live)
 
-        # 广播在锁外即可; 每条事件按座位过滤
-        await self._broadcast_events(live)
-        if finished is not None:
-            await self._announce_end(live, finished)
+            # 在锁内基于一致状态构造全部待发载荷(并推进 c.seq)
+            mail = await self._build_broadcast_mail_locked(live)
+            if finished is not None:
+                h = state_hash(live.state)
+                for c in list(live.clients.values()):
+                    mail[c].append({"type": "match_end",
+                                    "match_id": live.match_id,
+                                    "winner": finished[0],
+                                    "reason": finished[1], "state_hash": h})
 
-        await self._send(client.ws, {
-            "type": "command_result", "op_id": op_id,
-            "accepted": True, "state_hash": result["state_hash"],
-        })
+        # 锁外发送不可变载荷
+        for c, messages in mail.items():
+            for m in messages:
+                await self._send(c.ws, m)
+        return {"status": "applied", "state_hash": state_h}
 
-    def _compute_deadline(self, live: LiveMatch) -> float:
+    def _compute_deadline_locked(self, state: dict) -> float:
         now = time.time()
-        if live.state["phase"] == "response":
+        if state["phase"] == "response":
             return now + self.response_seconds
         return now + self.turn_seconds
 
+    def _rebuild_live_state(self, live: LiveMatch) -> None:
+        """用 SQLite 事件流重建内存状态(幂等竞争兜底/重启恢复共用)。"""
+        loaded = load_match_state(self.conn, live.match_id)
+        live.state = loaded["state"]
+        live.deadline_at = loaded["deadline_at"]
+        self._arm_timer_locked(live)
+
     # ------------------------------------------------------------- 广播/补发
 
-    async def _broadcast_events(self, live: LiveMatch) -> None:
+    async def _build_broadcast_mail_locked(self, live: LiveMatch) -> dict:
+        """在持有 live.lock 时调用。基于当前一致状态为每条连接构造待发载荷
+        (缺失事件 + 权威快照)并推进 c.seq; 不做任何网络 I/O。
+        返回 {client: [message, ...]}, 调用方在锁外投递。"""
+        mail: dict[Client, list[dict]] = {}
+        deadline = live.deadline_at
         for seat, c in list(live.clients.items()):
-            await self._catch_up(live, seat, c, since=c.seq)
-            await self._send_snapshot(live, seat, c)
+            messages: list[dict] = []
+            rows = storage.events_after(self.conn, live.match_id, c.seq)
+            last = c.seq
+            for row in rows:
+                last = row["seq"]
+                visible = public_event(row["event"], seat)
+                if visible is not None:
+                    messages.append({"type": "event", "seq": row["seq"],
+                                     "event": visible})
+            messages.append({
+                "type": "snapshot",
+                "state": public_state(live.state, seat),
+                "deadline_at": deadline,
+            })
+            c.seq = last
+            mail[c] = messages
+        return mail
 
-    async def _send_snapshot(self, live: LiveMatch, seat: int,
-                             c: Client) -> None:
-        await self._send(c.ws, {
-            "type": "snapshot",
-            "state": public_state(live.state, seat),
-            "deadline_at": live.deadline_at,
-        })
-
-    async def _catch_up(self, live: LiveMatch, seat: int, c: Client,
-                        since: int) -> None:
-        rows = storage.events_after(self.conn, live.match_id, since)
-        for row in rows:
-            visible = public_event(row["event"], seat)
-            if visible is not None:
-                await self._send(c.ws, {"type": "event",
-                                        "seq": row["seq"], "event": visible})
-            c.seq = row["seq"]
-
-    async def _announce_end(self, live: LiveMatch,
-                            finished: tuple[int | None, str]) -> None:
-        winner, reason = finished
-        for seat, c in live.clients.items():
-            await self._send(c.ws, {"type": "match_end",
-                                    "match_id": live.match_id,
-                                    "winner": winner, "reason": reason,
-                                    "state_hash": state_hash(live.state)})
+    async def _deliver_mail(self, mail: dict) -> None:
+        for c, messages in mail.items():
+            for m in messages:
+                await self._send(c.ws, m)
 
     # ------------------------------------------------------------- 重连
 
@@ -376,17 +449,33 @@ class GameServer:
             live = LiveMatch(mid, loaded["names"], loaded["state"],
                              deadline_at=loaded["deadline_at"])
             self.matches[mid] = live
-            self._arm_timer(mid)
+            async with live.lock:
+                self._arm_timer_locked(live)
         seat = live.seats.index(c.name) if c.name in live.seats else None
         if seat is None:
             return
-        self._attach(live, seat, c)
-        await self._send(c.ws, {"type": "match_resume", "match_id": mid,
-                                "seat": seat})
-        await self._catch_up(live, seat, c, since=0)
-        await self._send(c.ws, {"type": "snapshot",
-                                "state": public_state(live.state, seat),
-                                "deadline_at": live.deadline_at})
+        # 座位占用与事件补发必须在对局锁内完成: 不能让一条并发命令在
+        # "已 attach、未补发"之间推进 c.seq 造成事件乱序。
+        async with live.lock:
+            self._attach(live, seat, c)
+            messages = [{"type": "match_resume", "match_id": mid,
+                         "seat": seat}]
+            rows = storage.events_after(self.conn, mid, 0)
+            last = 0
+            for row in rows:
+                last = row["seq"]
+                visible = public_event(row["event"], seat)
+                if visible is not None:
+                    messages.append({"type": "event", "seq": row["seq"],
+                                     "event": visible})
+            messages.append({
+                "type": "snapshot",
+                "state": public_state(live.state, seat),
+                "deadline_at": live.deadline_at,
+            })
+            c.seq = last
+        for m in messages:
+            await self._send(c.ws, m)
 
     def _attach(self, live: LiveMatch, seat: int, c: Client) -> None:
         live.clients[seat] = c
@@ -415,67 +504,96 @@ class GameServer:
                     break
         if not live or live.state["winner"] is not None:
             return
-        # 一次性断线宽限: 每个小回合/响应窗只给一次, 延长截止时间并落库
-        window = (live.state["turn"], live.state["phase"],
-                  live.state["responder"])
-        window_key = hash(window)
-        if live.grace_used_window != window_key and live.deadline_at:
-            live.grace_used_window = window_key
-            live.deadline_at += self.grace
-            storage.set_deadline(self.conn, live.match_id, live.deadline_at)
-            self._arm_timer(live.match_id)
-            log.info("玩家 %s 断线, 对局 %s 宽限 %.0fs",
-                     c.name, live.match_id[:8], self.grace)
+        # 一次性断线宽限: 宽限判定与定时器重排必须在对局锁内, 否则可能与
+        # 正在排队的超时任务交错, 导致 deadline 被旧值覆盖。
+        async with live.lock:
+            window = (live.state["turn"], live.state["phase"],
+                      live.state["responder"])
+            window_key = hash(window)
+            if live.grace_used_window != window_key and live.deadline_at:
+                live.grace_used_window = window_key
+                live.deadline_at += self.grace
+                storage.set_deadline(self.conn, live.match_id,
+                                     live.deadline_at)
+                self._arm_timer_locked(live)
+                log.info("玩家 %s 断线, 对局 %s 宽限 %.0fs",
+                         c.name, live.match_id[:8], self.grace)
 
     # ------------------------------------------------------------- 超时
 
     def _arm_timer(self, match_id: str) -> None:
+        """仅用于启动恢复(尚无连接/命令竞争); 运行期一律用 _arm_timer_locked。"""
         live = self.matches.get(match_id)
-        if live is None or live.deadline_at is None:
+        if live is None:
             return
+        live.timer_epoch += 1
+        self._schedule(live)
+
+    def _arm_timer_locked(self, live: LiveMatch) -> None:
+        """必须在持有 live.lock 时调用: 自增代数让任何旧超时任务作废。"""
+        live.timer_epoch += 1
+        self._schedule(live)
+
+    def _schedule(self, live: LiveMatch) -> None:
         if live.timer_task:
             live.timer_task.cancel()
+            live.timer_task = None
+        if live.deadline_at is None:
+            return
+        epoch = live.timer_epoch
         delay = max(0.0, live.deadline_at - time.time())
-        live.timer_task = asyncio.create_task(self._fire_timer(match_id, delay))
+        live.timer_task = asyncio.create_task(
+            self._fire_timer(live.match_id, epoch, delay))
 
-    async def _fire_timer(self, match_id: str, delay: float) -> None:
+    async def _fire_timer(self, match_id: str, epoch: int,
+                          delay: float) -> None:
         await asyncio.sleep(delay)
         live = self.matches.get(match_id)
         if not live or live.state["winner"] is not None:
             return
-        # 可能因重连重新 arm 过; 二次确认
-        if live.deadline_at and time.time() < live.deadline_at - 0.05:
-            return
         async with live.lock:
-            if live.state["winner"] is not None:
+            # 三重作废检查: 已被更新的定时器取代 / 截止时间被宽限或命令延后 /
+            # 对局已结束。任何一条成立都不得结算, 杜绝陈旧超时重复落事件。
+            if (live.timer_epoch != epoch
+                    or live.timer_task is not asyncio.current_task()
+                    or live.state["winner"] is not None):
                 return
-            active = live.state["active"]
+            if live.deadline_at and time.time() < live.deadline_at - 0.01:
+                return
             seat = (live.state["responder"]
-                    if live.state["phase"] == "response" else active)
+                    if live.state["phase"] == "response"
+                    else live.state["active"])
             command = {"cmd": "SYSTEM_TIMEOUT", "seat": seat,
                        "reason": "deadline"}
             try:
                 new_events = decide(live.state, command)
             except RuleError:
                 return
+            staged = clone(live.state)
             finished = None
             for e in new_events:
-                fold(live.state, e)
+                fold(staged, e)
                 if e["type"] == "GAME_ENDED":
                     finished = (e["winner"], e["reason"])
-            deadline = None if finished else self._compute_deadline(live)
+            deadline = None if finished else self._compute_deadline_locked(
+                staged)
+            h = state_hash(staged)
             storage.apply_command(
                 self.conn, match_id, None, seat, command,
-                new_events, {"accepted": True,
-                             "state_hash": state_hash(live.state)},
+                new_events, {"accepted": True, "state_hash": h},
                 finished, deadline,
             )
+            live.state = staged
             live.deadline_at = deadline
-        await self._broadcast_events(live)
-        if finished is not None:
-            await self._announce_end(live, finished)
-        else:
-            self._arm_timer(match_id)
+            self._arm_timer_locked(live)
+            mail = await self._build_broadcast_mail_locked(live)
+            if finished is not None:
+                for c in list(live.clients.values()):
+                    mail.setdefault(c, []).append({
+                        "type": "match_end", "match_id": match_id,
+                        "winner": finished[0], "reason": finished[1],
+                        "state_hash": h})
+        await self._deliver_mail(mail)
 
     # ------------------------------------------------------------- 回放
 

@@ -12,11 +12,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
 from server.engine.state import state_hash
-from server.replay_support import load_match_state
+from server.replay_support import load_match_state, verify_match
 from server import storage
 
 from .conftest import (
@@ -379,4 +380,261 @@ async def test_idempotent_after_reconnect_same_op(server):
     assert res.get("duplicate") is True
     assert len(live.state["stack"]) == stack_before
     await c0.close()
+    await w1.close()
+
+
+# ============================================================
+# 并发幂等与反制结算竞争(修复回归测试)
+# ============================================================
+
+async def _result_for(ws, op_id, timeout=3.0):
+    """读取该连接上指定 op_id 的 command_result(忽略其他消息)。"""
+    while True:
+        msg = await recv(ws, timeout=timeout)
+        if (msg.get("type") == "command_result"
+                and msg.get("op_id") == op_id):
+            return msg
+
+
+async def _second_connection(server, player, token_player=None):
+    _, port = server
+    token = server[0].conn.execute(
+        "SELECT token FROM players WHERE name=?", (player,)).fetchone()[0]
+    ws = await ws_connect(port)
+    await send(ws, type="login", name=player, token=token)
+    await recv_until(ws, "login_ok")
+    await recv_until(ws, "match_resume")
+    await recv_until(ws, "snapshot")
+    return ws, token
+
+
+async def test_concurrent_same_op_id_charges_once(server):
+    """同一玩家两条连接在同一事件循环批次内发出完全相同的 op_id:
+    恰好一次 accepted, 另一次 duplicate; 能量只扣一次, 堆叠只有一张牌,
+    SQLite 事件流通过检查点校验。"""
+    (w0, m0), (w1, _) = await login_pair(server)
+    await _events(w0, 0.3)
+    await _events(w1, 0.3)
+    gs, _ = server
+    mid = m0["match_id"]
+    live = gs.matches[mid]
+    uid = next(c["uid"] for c in live.state["seats"][0]["hand"]
+               if c["id"] == "militia")
+
+    # 第二条连接以同一身份登入(会顶掉 w0 的座位注册, 但 w0 的 socket 仍在)
+    w0b, _ = await _second_connection(server, "alice")
+    energy_before = live.state["seats"][0]["energy"]
+
+    payload = {"type": "command", "op_id": "conc-1",
+               "command": {"cmd": "PLAY", "uid": uid, "target": 0}}
+    raw = json.dumps(payload)
+    # 同一批 await 点之前把两份字节都喂给服务端, 最大化竞争
+    await w0b.send(raw)
+    await w0.send(raw)
+    results = await asyncio.gather(
+        _result_for(w0b, "conc-1"),
+        _result_for(w0, "conc-1"),
+    )
+    accepted = [r for r in results if r.get("accepted") and not r.get("duplicate")]
+    duplicates = [r for r in results if r.get("duplicate")]
+    assert len(accepted) == 1 and len(duplicates) == 1, results
+    # 能量恰好扣 1
+    assert live.state["seats"][0]["energy"] == energy_before - 1
+    # 堆叠恰好 1 张, 没有重复事件
+    assert len(live.state["stack"]) == 1
+    n_played = gs.conn.execute(
+        "SELECT COUNT(*) AS n FROM events WHERE match_id=? AND after_cmd IN"
+        " (SELECT seq FROM commands WHERE match_id=? AND op_id='conc-1')",
+        (mid, mid)).fetchone()["n"]
+    # 该 op_id 在 commands 表中只有一行
+    assert gs.conn.execute(
+        "SELECT COUNT(*) AS n FROM commands WHERE match_id=? AND op_id='conc-1'",
+        (mid,)).fetchone()["n"] == 1
+    # 事件流重建哈希与内存一致
+    assert verify_match(gs.conn, mid)["hash"] == state_hash(live.state)
+    await w0b.close()
+    await w0.close()
+    await w1.close()
+
+
+async def test_counter_and_pass_race_resolves_once(server):
+    """响应窗内, 反制方的 COUNTER 与 PASS 用不同 op_id 竞争:
+    先到者生效, 后到者被规则拒绝(NOT_YOUR_WINDOW/WRONG_PHASE),
+    堆叠绝不结算两次, 事件流检查点一致。"""
+    (w0, m0), (w1, _) = await login_pair(server)
+    await _events(w0, 0.3)
+    await _events(w1, 0.3)
+    gs, _ = server
+    live = gs.matches[m0["match_id"]]
+
+    # alice 出牌打开响应窗(bob 为响应者)
+    uid = next(c["uid"] for c in live.state["seats"][0]["hand"]
+               if c["id"] == "militia")
+    await send(w0, type="command", op_id="open",
+               command={"cmd": "PLAY", "uid": uid, "target": 0})
+    await recv_until(w0, "command_result", op_id="open")
+    assert live.state["phase"] == "response" and live.state["responder"] == 1
+
+    # bob 同时发 PASS 与一条非法 COUNTER(手里未必有反制牌, 用假 uid):
+    # 无论先后, 只允许一条改变窗口; 另一条必须被拒绝而非二次结算
+    await send(w1, type="command", op_id="pass-1",
+               command={"cmd": "PASS"})
+    await send(w1, type="command", op_id="pass-2",
+               command={"cmd": "PASS"})
+    r1 = await _result_for(w1, "pass-1")
+    r2 = await _result_for(w1, "pass-2")
+    oks = [r for r in (r1, r2) if r.get("accepted")]
+    rejects = [r for r in (r1, r2) if not r.get("accepted")]
+    assert len(oks) == 1 and len(rejects) == 1, (r1, r2)
+
+    # 窗口此时应交给 alice(responder=0), 而不是被结算两次跳过
+    assert live.state["phase"] == "response"
+    assert live.state["responder"] == 0
+    assert len(live.state["stack"]) == 1
+    # alice 通过 -> 单位恰好部署一次
+    await send(w0, type="command", op_id="pass-a",
+               command={"cmd": "PASS"})
+    await recv_until(w0, "command_result", op_id="pass-a")
+    assert live.state["phase"] == "main"
+    assert len(live.state["seats"][0]["units"]) == 1
+    assert verify_match(gs.conn, m0["match_id"])["hash"] \
+        == state_hash(live.state)
+
+
+async def test_stale_timer_after_player_action_does_not_double_fire(server):
+    """玩家在截止时刻附近操作并重排了定时器: 旧超时任务即使已越过 sleep,
+    也必须因 epoch 变化而作废, 不得补一条 SYSTEM_TIMEOUT 重复结算。"""
+    gs, _ = server
+    # 为本局配置宽松确定的时序(开局前设置): 2.5s 回合、10s 响应窗
+    gs.turn_seconds = 2.5
+    gs.response_seconds = 10.0
+    gs.grace = 10.0
+    (w0, m0), (w1, _) = await login_pair(server)
+    await _events(w0, 0.3)
+    await _events(w1, 0.3)
+    live = gs.matches[m0["match_id"]]
+
+    # 建局后约 0.4s(匹配队列), 在回合截止前约 1s 出牌
+    await asyncio.sleep(1.4)
+    uid = next(c["uid"] for c in live.state["seats"][0]["hand"]
+               if c["id"] == "militia")
+    await send(w0, type="command", op_id="near-deadline",
+               command={"cmd": "PLAY", "uid": uid, "target": 0})
+    res = await recv_until(w0, "command_result", op_id="near-deadline")
+    assert res["accepted"] is True
+    # 越过原回合截止时刻: 旧任务必须已因 epoch 不匹配而自我作废
+    await asyncio.sleep(0.8)
+    assert live.state["phase"] == "response"
+    assert len(live.state["stack"]) == 1
+    timeouts = gs.conn.execute(
+        "SELECT COUNT(*) AS n FROM commands WHERE match_id=? AND cmd='SYSTEM_TIMEOUT'",
+        (m0["match_id"],)).fetchone()["n"]
+    assert timeouts == 0
+    # 事件流检查点仍然一致
+    assert verify_match(gs.conn, m0["match_id"])["hash"] \
+        == state_hash(live.state)
+
+
+async def test_full_match_event_stream_matches_checkpoints(server):
+    """驱动一整局(出牌+双方通过+结束回合, 系统超时兜底),
+    结束后 SQLite 检查点必须全部通过, 且最终状态与内存一致。"""
+    (w0, m0), (w1, _) = await login_pair(server)
+    await _events(w0, 0.3)
+    await _events(w1, 0.3)
+    gs, _ = server
+    mid = m0["match_id"]
+    live = gs.matches[mid]
+    opn = 0
+
+    def next_op():
+        nonlocal opn
+        opn += 1
+        return f"f-{opn}"
+
+    deadline = asyncio.get_event_loop().time() + 12
+    while (live.state["winner"] is None
+           and asyncio.get_event_loop().time() < deadline):
+        seat = (live.state["responder"]
+                if live.state["phase"] == "response"
+                else live.state["active"])
+        ws = w0 if seat == 0 else w1
+        if live.state["phase"] == "response":
+            await send(ws, type="command", op_id=next_op(),
+                       command={"cmd": "PASS"})
+            await asyncio.wait_for(_drain_one(ws), timeout=3)
+            continue
+        # 主阶段: 出一张能负担的单位到轮换据点, 否则结束回合
+        energy = live.state["seats"][seat]["energy"]
+        card = next((c for c in live.state["seats"][seat]["hand"]
+                     if c["id"] in ("militia", "infantry", "vanguard",
+                                    "guardian")
+                     and {"militia": 1, "infantry": 2, "vanguard": 3,
+                          "guardian": 4}[c["id"]] <= energy), None)
+        if card is not None:
+            await send(ws, type="command", op_id=next_op(),
+                       command={"cmd": "PLAY", "uid": card["uid"],
+                                "target": live.state["turn"] % 3})
+            await asyncio.wait_for(_drain_one(ws), timeout=3)
+        else:
+            await send(ws, type="command", op_id=next_op(),
+                       command={"cmd": "END_TURN"})
+            await asyncio.wait_for(_drain_one(ws), timeout=3)
+
+    assert live.state["winner"] is not None, "整局未能在时限内结束"
+    verified = verify_match(gs.conn, mid)
+    assert verified["hash"] == state_hash(live.state)
+    assert verified["status"] == "finished"
+    # 每条玩家命令都有且仅有一条检查点
+    n_player_cmds = gs.conn.execute(
+        "SELECT COUNT(*) AS n FROM commands WHERE match_id=? AND op_id IS NOT NULL",
+        (mid,)).fetchone()["n"]
+    n_ckpt = gs.conn.execute(
+        "SELECT COUNT(*) AS n FROM checkpoints WHERE match_id=?",
+        (mid,)).fetchone()["n"]
+    assert n_player_cmds == n_ckpt
+    await w0.close()
+    await w1.close()
+
+
+async def _drain_one(ws):
+    """取一条 command_result(忽略 snapshot/event 广播)。"""
+    while True:
+        msg = await recv(ws, timeout=3)
+        if msg.get("type") == "command_result":
+            return msg
+
+
+async def test_player_command_and_timeout_serialized_once(server):
+    """同一小回合上, 出牌与结束回合(语义互斥)在同一批次并发竞争对局锁:
+    严格串行后恰好一条生效, 另一条被规则拒绝; 事件流与检查点一致。
+    这同时覆盖了"玩家命令与超时竞争"的串行化保证(走同一锁入口)。"""
+    (w0, m0), (w1, _) = await login_pair(server)
+    await _events(w0, 0.3)
+    await _events(w1, 0.3)
+    gs, _ = server
+    mid = m0["match_id"]
+    live = gs.matches[mid]
+
+    uid = next(c["uid"] for c in live.state["seats"][0]["hand"]
+               if c["id"] == "militia")
+
+    async def play_now():
+        return await gs._apply_under_lock(
+            live, {"cmd": "PLAY", "seat": 0, "uid": uid, "target": 0},
+            "race-play")
+
+    async def end_now():
+        return await gs._apply_under_lock(
+            live, {"cmd": "END_TURN", "seat": 0}, "race-end")
+
+    t1, t2 = await asyncio.gather(play_now(), end_now())
+    statuses = sorted([t1["status"], t2["status"]])
+    assert "applied" in statuses and "rejected" in statuses, statuses
+    # 落库命令里只有一条玩家命令(另一条被规则拒绝, 不写库)
+    n_cmds = gs.conn.execute(
+        "SELECT COUNT(*) AS n FROM commands WHERE match_id=? AND op_id IS NOT NULL",
+        (mid,)).fetchone()["n"]
+    assert n_cmds == 1
+    assert verify_match(gs.conn, mid)["hash"] == state_hash(live.state)
+    await w0.close()
     await w1.close()

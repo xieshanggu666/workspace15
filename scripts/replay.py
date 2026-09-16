@@ -15,9 +15,11 @@ import json
 from server import storage
 from server.engine.fold import fold
 from server.engine.state import fresh_state, public_event, state_hash
+from server.replay_support import ReplayMismatch, verify_match
 
 
-def replay(db_path: str, match_id: str, viewer: str | None):
+def replay(db_path: str, match_id: str, viewer: str | None,
+           verify: bool = False):
     conn = storage.connect(db_path)
     m = storage.get_match(conn, match_id)
     if m is None:
@@ -40,6 +42,12 @@ def replay(db_path: str, match_id: str, viewer: str | None):
         "sites": state["sites"],
         "hash": state_hash(state),
     }, ensure_ascii=False))
+    if verify:
+        try:
+            result = verify_match(conn, match_id)
+        except ReplayMismatch as exc:
+            raise SystemExit(f"检查点校验失败: {exc}")
+        print(f"检查点校验通过: 全部命令边界哈希一致 (最终 {result['hash']})")
 
 
 def main() -> None:
@@ -47,8 +55,10 @@ def main() -> None:
     p.add_argument("--db", default="arena.db")
     p.add_argument("--match", required=True)
     p.add_argument("--viewer", default=None)
+    p.add_argument("--verify", action="store_true",
+                   help="逐条命令边界比对落库时的权威状态哈希")
     args = p.parse_args()
-    replay(args.db, args.match, args.viewer)
+    replay(args.db, args.match, args.viewer, args.verify)
 
 
 if __name__ == "__main__":
