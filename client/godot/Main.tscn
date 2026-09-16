@@ -1,0 +1,182 @@
+[gd_scene load_steps=2 format=3 uid="uid://arena_main_001"]
+
+[ext_resource type="Script" path="res://scripts/Main.gd" id="1_main"]
+
+[node name="Main" type="Control"]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+script = ExtResource("1_main")
+
+[node name="TopBar" type="HBoxContainer" parent="."]
+layout_mode = 0
+offset_left = 8.0
+offset_top = 4.0
+offset_right = 1272.0
+offset_bottom = 36.0
+
+[node name="Status" type="Label" parent="TopBar"]
+layout_mode = 2
+custom_minimum_size = Vector2(420, 0)
+text = "未连接"
+
+[node name="Timer" type="Label" parent="TopBar"]
+layout_mode = 2
+custom_minimum_size = Vector2(160, 0)
+text = ""
+
+[node name="Reconnect" type="Button" parent="TopBar"]
+layout_mode = 2
+text = "断线重连"
+
+[node name="Replay" type="Button" parent="TopBar"]
+layout_mode = 2
+text = "请求回放"
+
+[node name="Layout" type="TabContainer" parent="."]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_left = 8.0
+offset_top = 40.0
+offset_right = -8.0
+offset_bottom = -8.0
+
+[node name="Lobby" type="VBoxContainer" parent="Layout"]
+layout_mode = 2
+
+[node name="Row" type="HBoxContainer" parent="Layout/Lobby"]
+layout_mode = 2
+
+[node name="NameLabel" type="Label" parent="Layout/Lobby/Row"]
+layout_mode = 2
+text = "名字"
+
+[node name="NameEdit" type="LineEdit" parent="Layout/Lobby/Row"]
+layout_mode = 2
+custom_minimum_size = Vector2(180, 0)
+text = "alice"
+
+[node name="UrlLabel" type="Label" parent="Layout/Lobby/Row"]
+layout_mode = 2
+text = "服务端"
+
+[node name="UrlEdit" type="LineEdit" parent="Layout/Lobby/Row"]
+layout_mode = 2
+custom_minimum_size = Vector2(280, 0)
+text = "ws://127.0.0.1:8765"
+
+[node name="Connect" type="Button" parent="Layout/Lobby/Row"]
+layout_mode = 2
+text = "登录并匹配"
+
+[node name="DeckEdit" type="HBoxContainer" parent="Layout/Lobby"]
+layout_mode = 2
+size_flags_vertical = 3
+
+[node name="Cards" type="GridContainer" parent="Layout/Lobby/DeckEdit"]
+layout_mode = 2
+size_flags_horizontal = 3
+columns = 2
+
+[node name="List" type="Label" parent="Layout/Lobby/DeckEdit"]
+layout_mode = 2
+size_flags_horizontal = 3
+autowrap_mode = 3
+text = "牌组 (0/15)"
+
+[node name="Battle" type="HBoxContainer" parent="Layout"]
+layout_mode = 2
+
+[node name="Center" type="VBoxContainer" parent="Layout/Battle"]
+layout_mode = 2
+size_flags_horizontal = 3
+
+[node name="Board" type="VBoxContainer" parent="Layout/Battle/Center"]
+layout_mode = 2
+size_flags_vertical = 3
+
+[node name="Sites" type="HBoxContainer" parent="Layout/Battle/Center/Board"]
+layout_mode = 2
+size_flags_vertical = 3
+alignment = 1
+
+[node name="Site0" type="PanelContainer" parent="Layout/Battle/Center/Board/Sites"]
+layout_mode = 2
+custom_minimum_size = Vector2(280, 300)
+
+[node name="Info" type="RichTextLabel" parent="Layout/Battle/Center/Board/Sites/Site0"]
+layout_mode = 2
+bbcode_enabled = true
+fit_content = true
+text = "[b]据点 0[/b]"
+
+[node name="Site1" type="PanelContainer" parent="Layout/Battle/Center/Board/Sites"]
+layout_mode = 2
+custom_minimum_size = Vector2(280, 300)
+
+[node name="Info" type="RichTextLabel" parent="Layout/Battle/Center/Board/Sites/Site1"]
+layout_mode = 2
+bbcode_enabled = true
+fit_content = true
+text = "[b]据点 1[/b]"
+
+[node name="Site2" type="PanelContainer" parent="Layout/Battle/Center/Board/Sites"]
+layout_mode = 2
+custom_minimum_size = Vector2(280, 300)
+
+[node name="Info" type="RichTextLabel" parent="Layout/Battle/Center/Board/Sites/Site2"]
+layout_mode = 2
+bbcode_enabled = true
+fit_content = true
+text = "[b]据点 2[/b]"
+
+[node name="Hand" type="VBoxContainer" parent="Layout/Battle/Center"]
+layout_mode = 2
+
+[node name="OppCount" type="Label" parent="Layout/Battle/Center/Hand"]
+layout_mode = 2
+text = "对手手牌: ?"
+
+[node name="Energy" type="Label" parent="Layout/Battle/Center/Hand"]
+layout_mode = 2
+text = "能量: 0"
+
+[node name="Cards" type="HBoxContainer" parent="Layout/Battle/Center/Hand"]
+layout_mode = 2
+size_flags_horizontal = 3
+
+[node name="Actions" type="HBoxContainer" parent="Layout/Battle/Center/Hand"]
+layout_mode = 2
+
+[node name="SitePicker" type="OptionButton" parent="Layout/Battle/Center/Hand/Actions"]
+layout_mode = 2
+
+[node name="Play" type="Button" parent="Layout/Battle/Center/Hand/Actions"]
+layout_mode = 2
+text = "出牌"
+
+[node name="Pass" type="Button" parent="Layout/Battle/Center/Hand/Actions"]
+layout_mode = 2
+text = "通过(响应)"
+
+[node name="EndTurn" type="Button" parent="Layout/Battle/Center/Hand/Actions"]
+layout_mode = 2
+text = "结束小回合"
+
+[node name="Right" type="VBoxContainer" parent="Layout/Battle"]
+layout_mode = 2
+custom_minimum_size = Vector2(280, 0)
+
+[node name="LogTitle" type="Label" parent="Layout/Battle/Right"]
+layout_mode = 2
+text = "对局日志"
+
+[node name="Log" type="RichTextLabel" parent="Layout/Battle/Right"]
+layout_mode = 2
+size_flags_vertical = 3
+bbcode_enabled = true
+scroll_following = true
+text = ""

@@ -1,0 +1,20 @@
+; Godot 4.x 客户端工程
+; 权威逻辑全部在服务端, 客户端只做渲染与指令转发。
+
+config_version=5
+
+[application]
+
+config/name="据点卡牌竞技场"
+run/main_scene="res://Main.tscn"
+config/features=PackedStringArray("4.2")
+
+[display]
+
+window/size/viewport_width=1280
+window/size/viewport_height=720
+
+[rendering]
+
+renderer/rendering_method="gl_compatibility"
+renderer/rendering_method.mobile="gl_compatibility"
