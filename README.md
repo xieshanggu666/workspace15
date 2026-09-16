@@ -37,6 +37,11 @@ Godot 4 客户端 + **无界面权威服务端**（Python / asyncio / WebSocket 
   `matches.status` 置为 `corrupt`（原因入 `corruption` 审计表）、摘除内存
   对象并取消定时器、向在场连接和重连者发 `match_corrupt`。损坏对局不能借
   重连复活、定时器不再触发，事件保留供只读回放审计。
+- **排队操作的并发隔离**：命令/超时取锁后先过 `_check_live_gate`（对象仍
+  注册、DB 仍 running、无赢家），排队等锁期间被隔离/结束的操作一律拒绝；
+  `apply_command` 事务内再做 `status='running'` 守卫（`MatchNotRunning`
+  整体回滚），截止时间 UPDATE 带状态条件，三层保证隔离后迟到操作无法落库
+  或覆盖隔离状态。
 - **掉线可恢复**：令牌持久化；重连登录后自动 `match_resume` → 补发缺失事件 →
   下发权威 snapshot。断线在每个回合/响应窗给予一次宽限，宽限落库，重启后延续。
 - **超时由服务端驱动**：客户端无法靠不响应卡住对局。响应窗超时=强制通过，
@@ -61,7 +66,7 @@ server/
   server.py          WebSocket 连接/匹配/广播/超时/重连/重启恢复
   __main__.py        python -m server
 client/godot/        Godot 4 工程(主场景 Main.tscn, 纯渲染+转发)
-tests/               12 引擎 + 4 存储并发 + 17 WebSocket 集成 + 8 损坏隔离测试
+tests/               12 引擎 + 4 存储并发 + 17 WebSocket 集成 + 8 损坏隔离 + 7 排队并发测试
 scripts/             启动/测试/回放 CLI
 docs/PROTOCOL.md     消息与事件协议
 ```

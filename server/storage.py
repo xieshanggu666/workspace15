@@ -17,6 +17,10 @@ import secrets
 import time
 from typing import Any
 
+class MatchNotRunning(Exception):
+    """命令事务内发现对局已不是 running(已结束/已隔离), 必须拒绝写入。"""
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS players (
     name   TEXT PRIMARY KEY,
@@ -150,8 +154,12 @@ def latest_match_for(conn: sqlite3.Connection, name: str) -> tuple[str, str] | N
 
 def set_deadline(conn: sqlite3.Connection, match_id: str,
                  deadline_at: float | None) -> None:
-    conn.execute("UPDATE matches SET deadline_at=? WHERE match_id=?",
-                 (deadline_at, match_id))
+    """只刷新仍在运行的对局截止时间; 已隔离/结束的对局不得被复活。"""
+    conn.execute(
+        "UPDATE matches SET deadline_at=? WHERE match_id=?"
+        " AND status='running'",
+        (deadline_at, match_id),
+    )
     conn.commit()
 
 
@@ -274,6 +282,17 @@ def apply_command(
             if existing:
                 return {"duplicate": True, **json.loads(existing["result"])}
 
+        # 事务内状态闸门: 排队等锁期间对局可能已被隔离/结束。
+        # 任何命令(含系统超时)都只能写 running 的对局; 否则整体回滚,
+        # 绝不向 corrupt/finished 对局追加命令与事件。
+        row = conn.execute(
+            "SELECT status FROM matches WHERE match_id=?", (match_id,)
+        ).fetchone()
+        if row is None:
+            raise MatchNotRunning(match_id)
+        if row["status"] != "running":
+            raise MatchNotRunning(f"{match_id}: {row['status']}")
+
         try:
             cur = conn.execute(
                 "INSERT INTO commands(match_id, op_id, seat, cmd, payload, at)"
@@ -313,10 +332,14 @@ def apply_command(
                     (winner, reason, match_id),
                 )
             else:
+                # 仅 running 对局刷新截止时间; 条件不满足(已隔离/结束)不动状态
                 conn.execute(
-                    "UPDATE matches SET deadline_at=? WHERE match_id=?",
+                    "UPDATE matches SET deadline_at=? WHERE match_id=?"
+                    " AND status='running'",
                     (deadline_at, match_id),
                 )
+        except MatchNotRunning:
+            raise  # 交由 with conn 回滚后向上抛出
         except sqlite3.IntegrityError:
             # 唯一约束(op_id 重复)冲突: with conn 会回滚全部写入
             row = conn.execute(

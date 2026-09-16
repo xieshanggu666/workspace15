@@ -335,6 +335,10 @@ class GameServer:
         command["seat"] = seat
 
         outcome = await self._apply_under_lock(live, command, op_id)
+        # 锁已释放: 投递结算邮件(事件/快照/结束/隔离通知)
+        mail = outcome.pop("_mail", None)
+        if mail:
+            await self._deliver_mail(mail)
 
         if outcome["status"] == "duplicate":
             # 重复 op_id: 回首次结果; 不结算、不扣费、不追加事件
@@ -352,11 +356,18 @@ class GameServer:
             })
             return
         if outcome["status"] == "corrupt":
-            # 对局已隔离; 给发起者的命令回执(通知广播已在锁外投递过)
             await self._send(client.ws, {
                 "type": "command_result", "op_id": op_id,
                 "accepted": False, "code": "MATCH_CORRUPT",
                 "message": "对局事件流校验失败, 已被隔离",
+            })
+            return
+        if outcome["status"] == "ended":
+            # 排队等锁期间对局已结束/被摘除: 拒绝且不产生任何写入
+            await self._send(client.ws, {
+                "type": "command_result", "op_id": op_id,
+                "accepted": False, "code": "MATCH_ENDED",
+                "message": "对局已结束",
             })
             return
 
@@ -367,88 +378,139 @@ class GameServer:
 
     async def _apply_under_lock(self, live: LiveMatch, command: dict,
                                 op_id: str | None) -> dict:
-        """玩家命令与系统超时唯一的结算入口。
+        """玩家命令与系统超时唯一的结算入口(自管对局锁)。"""
+        async with live.lock:
+            return await self._apply_locked(live, command, op_id)
+
+    async def _apply_locked(self, live: LiveMatch, command: dict,
+                            op_id: str | None) -> dict:
+        """结算核心。必须(且已经)持有 live.lock 时调用。
 
         关键不变量:
-        1. 全程持有 live.lock(仅在网络发送时不持有, 见下), 并发命令(含同
-           op_id 重发、玩家命令与超时竞争)被严格串行化, 不会重复结算。
-        2. 先在状态克隆上 fold 并提交 SQLite, 提交成功后才替换 live.state;
-           任何中途异常都不会污染权威内存状态。
-        3. 广播载荷在锁内基于一致状态构造并推进 c.seq, 网络发送移到锁外,
-           避免发送期间让出锁而与后续命令交错。
+        1. 锁内闸门保证排队等锁期间被隔离/结束的操作绝不结算;
+        2. 先在状态克隆上 fold 并提交 SQLite(带 status='running' 守卫),
+           提交成功后才替换 live.state; 任何中途异常都不污染内存;
+        3. 广播载荷在锁内基于一致状态构造, 网络发送移到锁外。
+        返回 {status, ...}, status 为 applied/duplicate/rejected/corrupt/ended。
         """
-        async with live.lock:
-            corrupt_mail: dict[Client, list[dict]] = {}
-            mail: dict[Client, list[dict]] = {}
-            if op_id is not None:
-                cached = storage.cached_result(self.conn, live.match_id, op_id)
-                if cached is not None:
-                    return {"status": "duplicate",
-                            "state_hash": cached.get("state_hash")}
+        corrupt_mail: dict[Client, list[dict]] = {}
+        mail: dict[Client, list[dict]] = {}
 
-            try:
-                new_events = decide(live.state, command)
-            except RuleError as e:
-                return {"status": "rejected", "code": e.code,
-                        "message": str(e)}
+        # 锁内闸门: 命令/超时任务可能在取锁前就持有了 live 引用并排队,
+        # 期间对局已被隔离/结束。只有仍注册、DB 仍 running、无赢家的
+        # 对局才允许继续, 排队操作一律拒绝且不产生任何写入。
+        gate = self._check_live_gate(live)
+        if gate is not None:
+            return {"status": gate}
 
-            # 在克隆上结算; 此刻 live.state 仍未改变
-            staged = clone(live.state)
-            finished = None
-            for e in new_events:
-                fold(staged, e)
-                if e["type"] == "GAME_ENDED":
-                    finished = (e["winner"], e["reason"])
+        if op_id is not None:
+            cached = storage.cached_result(self.conn, live.match_id, op_id)
+            if cached is not None:
+                return {"status": "duplicate",
+                        "state_hash": cached.get("state_hash")}
 
-            deadline = None if finished else self._compute_deadline_locked(
-                staged)
-            state_h = state_hash(staged)
+        try:
+            new_events = decide(live.state, command)
+        except RuleError as e:
+            return {"status": "rejected", "code": e.code,
+                    "message": str(e)}
+
+        # 在克隆上结算; 此刻 live.state 仍未改变
+        staged = clone(live.state)
+        finished = None
+        for e in new_events:
+            fold(staged, e)
+            if e["type"] == "GAME_ENDED":
+                finished = (e["winner"], e["reason"])
+
+        deadline = None if finished else self._compute_deadline_locked(staged)
+        state_h = state_hash(staged)
+        try:
             stored = storage.apply_command(
                 self.conn, live.match_id, op_id, command.get("seat"),
-                command, new_events, {"accepted": True, "state_hash": state_h},
+                command, new_events,
+                {"accepted": True, "state_hash": state_h},
                 finished, deadline,
             )
-            if stored.get("duplicate"):
-                # 存储层兜底命中(跨进程/竞争窗口): 本次 staged 状态作废。
-                # 用带校验的事件流重建内存; 若事件流本身已损坏则隔离整局,
-                # 绝不让损坏状态继续结算。
-                attached = list(live.clients.values())
-                rebuilt = self._rebuild_live_state(live)
-                if rebuilt is None:
-                    corrupt_mail = {c: [{
-                        "type": "match_corrupt",
-                        "match_id": live.match_id,
-                        "message": "对局事件流校验失败, 已被隔离",
-                    }] for c in attached}
-                    state_h = stored.get("state_hash")
-                else:
-                    return {"status": "duplicate",
-                            "state_hash": stored.get("state_hash")}
+        except storage.MatchNotRunning:
+            # 闸门与提交之间对局被隔离/结束(跨连接竞争): staged 作废,
+            # 事务已整体回滚。重新判定状态并返回, 不发布任何内存变更。
+            return {"status": self._check_live_gate(live) or "ended"}
+
+        if stored.get("duplicate"):
+            # 存储层兜底命中(跨进程/竞争窗口): 本次 staged 状态作废。
+            # 用带校验的事件流重建内存; 若事件流本身已损坏则隔离整局。
+            attached = list(live.clients.values())
+            rebuilt = self._rebuild_live_state(live)
+            if rebuilt is None:
+                corrupt_mail = {c: [{
+                    "type": "match_corrupt",
+                    "match_id": live.match_id,
+                    "message": "对局事件流校验失败, 已被隔离",
+                }] for c in attached}
+                state_h = stored.get("state_hash")
             else:
-                # 事务提交成功后才发布到权威内存状态
-                live.state = staged
-                live.deadline_at = deadline
-                self._arm_timer_locked(live)
+                return {"status": "duplicate",
+                        "state_hash": stored.get("state_hash")}
+        else:
+            # 事务提交成功后才发布到权威内存状态
+            live.state = staged
+            live.deadline_at = deadline
+            self._arm_timer_locked(live)
 
-                # 在锁内基于一致状态构造全部待发载荷(并推进 c.seq)
-                mail = await self._build_broadcast_mail_locked(live)
-                if finished is not None:
-                    h = state_hash(live.state)
-                    for c in list(live.clients.values()):
-                        mail[c].append({"type": "match_end",
-                                        "match_id": live.match_id,
-                                        "winner": finished[0],
-                                        "reason": finished[1],
-                                        "state_hash": h})
+            # 在锁内基于一致状态构造全部待发载荷(并推进 c.seq)
+            mail = await self._build_broadcast_mail_locked(live)
+            if finished is not None:
+                h = state_hash(live.state)
+                for c in list(live.clients.values()):
+                    mail[c].append({"type": "match_end",
+                                    "match_id": live.match_id,
+                                    "winner": finished[0],
+                                    "reason": finished[1],
+                                    "state_hash": h})
+                # DB 已置 finished: 摘除注册对象, 使任何持有旧 live
+                # 引用的排队操作/陈旧任务在闸门身份校验处失效。
+                self.matches.pop(live.match_id, None)
 
-        # 锁外发送不可变载荷
-        outgoing = corrupt_mail or mail
-        for c, messages in outgoing.items():
-            for m in messages:
-                await self._send(c.ws, m)
-        if corrupt_mail:
-            return {"status": "corrupt"}
-        return {"status": "applied", "state_hash": state_h}
+        # 网络发送推迟到调用方在锁外进行; 这里把邮件挂在返回值里
+        outcome = {"status": "corrupt" if corrupt_mail else "applied",
+                   "_mail": corrupt_mail or mail}
+        if not corrupt_mail:
+            outcome["state_hash"] = state_h
+        else:
+            outcome["state_hash"] = state_h
+        return outcome
+
+    def _check_live_gate(self, live: LiveMatch) -> str | None:
+        """必须在持有 live.lock 时调用。
+
+        校验"排队等锁的操作是否仍可执行":
+        1. 该 live 对象仍是 self.matches 中的注册对象(隔离后旧对象失效);
+        2. DB 中对局状态仍为 running(未被其他路径隔离/结束);
+        3. 内存状态未产生赢家。
+        返回 None 表示放行; 否则返回拒绝状态 "corrupt" / "ended"。
+        """
+        mid = live.match_id
+        registered = self.matches.get(mid) is live
+        status = storage.match_status(self.conn, mid)
+        if status == "corrupt" or (not registered and status != "finished"):
+            # DB 已隔离, 或对象被摘除且对局不是正常结束 -> 按损坏处理,
+            # 确保内存中不存在可继续结算的对象并取消定时器。
+            if registered:
+                self.matches.pop(mid, None)
+                if live.timer_task:
+                    live.timer_task.cancel()
+                    live.timer_task = None
+            return "corrupt"
+        if status != "running" or live.state.get("winner") is not None:
+            # 自然结束(finished): 若内存中仍残留则摘除, 但不改写 DB
+            if registered:
+                self.matches.pop(mid, None)
+                if live.timer_task:
+                    live.timer_task.cancel()
+                    live.timer_task = None
+            return "ended"
+        return None
 
     def _compute_deadline_locked(self, state: dict) -> float:
         now = time.time()
@@ -684,26 +746,28 @@ class GameServer:
         live = self.matches.get(match_id)
         if not live or live.state["winner"] is not None:
             return
-        async with live.lock:
-            # 三重作废检查: 已被更新的定时器取代 / 截止时间被宽限或命令延后 /
-            # 对局已结束。任何一条成立都不得结算, 杜绝陈旧超时重复落事件。
-            stale = (
-                live.timer_epoch != epoch
-                or live.timer_task is not asyncio.current_task()
-                or live.state["winner"] is not None
-                or storage.match_status(self.conn, match_id) != "running"
-                or (live.deadline_at
-                    and time.time() < live.deadline_at - 0.01)
-            )
-        if stale:
+        # 快速路径(锁外): 明显陈旧的任务直接退出, 不竞争锁
+        if live.timer_epoch != epoch:
             return
-        seat = (live.state["responder"]
-                if live.state["phase"] == "response"
-                else live.state["active"])
-        # 与玩家命令同一结算入口: 锁内校验/克隆/事务提交/隔离处理一致
-        await self._apply_under_lock(
-            live, {"cmd": "SYSTEM_TIMEOUT", "seat": seat,
-                   "reason": "deadline"}, None)
+        outcome = None
+        async with live.lock:
+            # 定时器专属的代数/身份检查(通用闸门不检查 epoch):
+            # 命令重排定时器后, 旧任务即使正在等锁也必须在此作废。
+            current_task = asyncio.current_task()
+            if (live.timer_epoch != epoch
+                    or live.timer_task is not current_task):
+                return
+            seat = (live.state["responder"]
+                    if live.state["phase"] == "response"
+                    else live.state["active"])
+            # 与玩家命令同一结算核心: 闸门 + 克隆 + 事务守卫, 不再取锁
+            outcome = await self._apply_locked(
+                live, {"cmd": "SYSTEM_TIMEOUT", "seat": seat,
+                       "reason": "deadline"}, None)
+        # 锁外投递广播
+        mail = outcome.pop("_mail", None) if outcome else None
+        if mail:
+            await self._deliver_mail(mail)
 
     # ------------------------------------------------------------- 回放
 

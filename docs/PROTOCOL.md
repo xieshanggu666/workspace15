@@ -59,6 +59,23 @@
 找回、不能借重连复活、定时器不再触发；其事件保留仅供 `replay` / `--verify`
 排查（回放响应带 `status` 与 `verify_error`）。
 
+## 排队操作与隔离的并发安全
+
+命令与超时任务在取锁**之前**就持有 `live` 对象引用。为防止“排队等锁期间
+对局被隔离/结束，取锁后仍继续结算并覆盖隔离状态”，有三层防护：
+
+1. **锁内闸门** `_check_live_gate`：取锁后首先验证 `live` 仍是注册表中的
+   对象、DB `status='running'`、内存无赢家；不满足直接返回 `corrupt`/`ended`，
+   不 decide、不 fold、不写库（发现 DB 已 corrupt 时顺带摘除内存对象）。
+2. **DB 事务守卫**：`apply_command` 在同一事务内、写任何行之前先查
+   `status`，非 running 即抛 `MatchNotRunning` 并整体回滚——即使绕过内存闸门
+   （跨连接/进程竞争），命令、事件、检查点也一个写不进去。
+3. **截止时间条件更新**：`set_deadline` 与普通命令的截止刷新都带
+   `AND status='running'`，不会把 corrupt/finished 对局复活。
+
+结算核心拆为 `_apply_under_lock`（玩家命令，自管锁）与 `_apply_locked`
+（超时任务已持锁时调用，避免重入死锁）；广播邮件在锁内构造、锁外投递。
+
 ## 事件类型（落库 + 回放共用，按触发顺序）
 
 ```
